@@ -16,16 +16,27 @@ type snapshot struct {
 	ByExternal map[string]string          `json:"by_external"`
 	Rotations  map[string]*RotationRecord `json:"rotations"`
 	// OpenRotation 记录每台设备当前唯一的未终态轮换。
-	OpenRotation map[string]string `json:"open_rotation"`
+	OpenRotation map[string]string          `json:"open_rotation"`
+	Transfers    map[string]*TransferRecord `json:"transfers"`
+	// OpenTransfer 记录每台设备当前唯一的未终态转移。
+	OpenTransfer map[string]string `json:"open_transfer"`
+	// TransferByKey 保证 (源租户, 转移号) 唯一，支撑转移发起的幂等返回与冲突判定。
+	TransferByKey map[string]string `json:"transfer_by_key"`
+	// Ownership 记录每台设备的归属链（含注册初始归属），按发生顺序追加。
+	Ownership map[string][]*OwnershipEvent `json:"ownership"`
 }
 
 func newSnapshot() *snapshot {
 	return &snapshot{
-		Challenges:   map[string]*ChallengeRecord{},
-		Devices:      map[string]*DeviceRecord{},
-		ByExternal:   map[string]string{},
-		Rotations:    map[string]*RotationRecord{},
-		OpenRotation: map[string]string{},
+		Challenges:    map[string]*ChallengeRecord{},
+		Devices:       map[string]*DeviceRecord{},
+		ByExternal:    map[string]string{},
+		Rotations:     map[string]*RotationRecord{},
+		OpenRotation:  map[string]string{},
+		Transfers:     map[string]*TransferRecord{},
+		OpenTransfer:  map[string]string{},
+		TransferByKey: map[string]string{},
+		Ownership:     map[string][]*OwnershipEvent{},
 	}
 }
 
@@ -62,7 +73,8 @@ func (s *Store) Load() (*snapshot, error) {
 			return nil, err
 		}
 		if snap.Challenges == nil || snap.Devices == nil || snap.ByExternal == nil ||
-			snap.Rotations == nil || snap.OpenRotation == nil {
+			snap.Rotations == nil || snap.OpenRotation == nil || snap.Transfers == nil ||
+			snap.OpenTransfer == nil || snap.TransferByKey == nil || snap.Ownership == nil {
 			return nil, errors.New("deviceenrollment: corrupt snapshot: missing collections")
 		}
 	}

@@ -41,6 +41,21 @@ const (
 	ErrCodeRotationClosed ErrorCode = "rotation_closed"
 	// ErrCodeSignatureInvalid 认证或确认所附签名校验失败。
 	ErrCodeSignatureInvalid ErrorCode = "signature_invalid"
+	// ErrCodeTransferInProgress 设备已有未终态的转移，不能重复发起。
+	ErrCodeTransferInProgress ErrorCode = "transfer_in_progress"
+	// ErrCodeTransferNotFound 转移单不存在。
+	ErrCodeTransferNotFound ErrorCode = "transfer_not_found"
+	// ErrCodeTransferClosed 转移已处于终态（接受/取消/过期/中止），拒绝迟到操作。
+	ErrCodeTransferClosed ErrorCode = "transfer_closed"
+	// ErrCodeTransferCredentialMismatch 一次性接收凭据缺失或不匹配。
+	ErrCodeTransferCredentialMismatch ErrorCode = "transfer_credential_mismatch"
+	// ErrCodeTransferExpired 转移凭据已超过接收窗口。
+	ErrCodeTransferExpired ErrorCode = "transfer_expired"
+	// ErrCodeTenantMismatch 调用方不是该操作所要求的租户（源/目标租户身份不符）。
+	ErrCodeTenantMismatch ErrorCode = "tenant_mismatch"
+	// ErrCodeDeviceVersionMismatch 发起时冻结的设备版本与当前不一致，
+	// 设备在此期间已发生轮换等状态变更。
+	ErrCodeDeviceVersionMismatch ErrorCode = "device_version_mismatch"
 )
 
 // Error 携带错误码的领域错误。

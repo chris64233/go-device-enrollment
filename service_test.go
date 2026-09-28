@@ -48,9 +48,9 @@ func mustKey(t *testing.T) deviceKey {
 	return deviceKey{pub: pub, priv: priv}
 }
 
-func (e *testEnv) issue(t *testing.T, external string, attrs []byte, ttl time.Duration) *Challenge {
+func (e *testEnv) issue(t *testing.T, external, tenant string, attrs []byte, ttl time.Duration) *Challenge {
 	t.Helper()
-	ch, err := e.svc.IssueChallenge(external, attrs, ttl)
+	ch, err := e.svc.IssueChallenge(external, tenant, attrs, ttl)
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -103,7 +103,7 @@ func mustAuth(t *testing.T, svc *Service, dev *DeviceView, k deviceKey, msg []by
 
 func TestIssueChallenge_StoresDigestOnly(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
-	ch := env.issue(t, "dev-1", []byte("model-A"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("model-A"), 0)
 
 	if ch.ID == "" || ch.Secret == "" {
 		t.Fatal("challenge id/secret empty")
@@ -135,7 +135,7 @@ func TestIssueChallenge_StoresDigestOnly(t *testing.T) {
 func TestRegister_ChallengeSecretAndLifecycle(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
 	k := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 
 	// 错误秘密。
 	bad := *ch
@@ -161,7 +161,7 @@ func TestRegister_ChallengeSecretAndLifecycle(t *testing.T) {
 func TestRegister_AttestationFailure(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
 	k := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 
 	_, err := env.svc.Register(RegisterRequest{
 		ChallengeID: ch.ID, Secret: ch.Secret, ExternalID: "dev-1",
@@ -176,7 +176,7 @@ func TestRegister_AttestationFailure(t *testing.T) {
 func TestRegister_AttributeBinding(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
 	k := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("expected"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("expected"), 0)
 
 	// 外部注册号不一致。
 	if _, err := env.register(t, ch, "dev-2", []byte("expected"), k); ErrorCodeOf(err) != ErrCodeChallengeAttributeMismatch {
@@ -193,7 +193,7 @@ func TestRegister_AttributeBinding(t *testing.T) {
 func TestRegister_IdempotentSameContent(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
 	k := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 
 	dev1 := mustRegister(t, env, ch, "dev-1", []byte("attr"), k)
 
@@ -207,7 +207,7 @@ func TestRegister_IdempotentSameContent(t *testing.T) {
 	}
 
 	// 用另一把新挑战为同一外部号、同一内容注册，同样返回原身份且新挑战保持未消费。
-	ch2 := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch2 := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 	dev3, err := env.register(t, ch2, "dev-1", []byte("attr"), k)
 	if err != nil {
 		t.Fatalf("second-challenge same content: %v", err)
@@ -227,7 +227,7 @@ func TestRegister_ConflictDifferentContent(t *testing.T) {
 	env := newTestEnv(t, time.Minute, time.Minute)
 	k1 := mustKey(t)
 	k2 := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 
 	dev1 := mustRegister(t, env, ch, "dev-1", []byte("attr"), k1)
 
@@ -236,7 +236,7 @@ func TestRegister_ConflictDifferentContent(t *testing.T) {
 		t.Fatalf("want conflict, got %v", err)
 	}
 	// 同号异内容（不同属性）同样冲突。
-	ch3 := env.issue(t, "dev-1", []byte("other"), 0)
+	ch3 := env.issue(t, "dev-1", "tenant-a", []byte("other"), 0)
 	k3 := mustKey(t)
 	if _, err := env.register(t, ch3, "dev-1", []byte("other"), k3); ErrorCodeOf(err) != ErrCodeConflict {
 		t.Fatalf("want conflict for different attributes, got %v", err)
@@ -255,7 +255,7 @@ func TestRegister_ConcurrentSingleChallengeOneWinner(t *testing.T) {
 
 	t.Run("same_content_all_see_same_device", func(t *testing.T) {
 		k := mustKey(t)
-		ch := env.issue(t, "dev-conc-1", []byte("attr"), 0)
+		ch := env.issue(t, "dev-conc-1", "tenant-a", []byte("attr"), 0)
 
 		const n = 32
 		var wg sync.WaitGroup
@@ -297,7 +297,7 @@ func TestRegister_ConcurrentSingleChallengeOneWinner(t *testing.T) {
 	})
 
 	t.Run("different_content_only_one_created", func(t *testing.T) {
-		ch := env.issue(t, "dev-conc-2", []byte("attr"), 0)
+		ch := env.issue(t, "dev-conc-2", "tenant-a", []byte("attr"), 0)
 
 		const n = 32
 		var wg sync.WaitGroup
@@ -350,7 +350,7 @@ func beginRotation(t *testing.T, env *testEnv, dev *DeviceView, oldK, newK devic
 func TestRotation_HappyPath(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", []byte("attr"), 0)
+	ch := env.issue(t, "dev-1", "tenant-a", []byte("attr"), 0)
 	dev := mustRegister(t, env, ch, "dev-1", []byte("attr"), oldK)
 
 	newK := mustKey(t)
@@ -423,7 +423,7 @@ func TestRotation_HappyPath(t *testing.T) {
 func TestRotation_BothConfirmationsAtomic(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 	rot := beginRotation(t, env, dev, oldK, newK)
@@ -457,7 +457,7 @@ func TestRotation_BothConfirmationsAtomic(t *testing.T) {
 func TestRotation_Cancel(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 	rot := beginRotation(t, env, dev, oldK, newK)
@@ -502,7 +502,7 @@ func TestRotation_Cancel(t *testing.T) {
 func TestRotation_Timeout(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 	rot := beginRotation(t, env, dev, oldK, newK)
@@ -552,7 +552,7 @@ func TestRotation_Timeout(t *testing.T) {
 func TestRotation_TimeoutIsLazyAndDeadlineInclusive(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 	rot := beginRotation(t, env, dev, oldK, newK)
@@ -581,7 +581,7 @@ func TestRotation_ConfirmCancelTimeoutRace_OneTerminalState(t *testing.T) {
 	for iter := 0; iter < 20; iter++ {
 		env := newTestEnv(t, time.Minute, 10*time.Minute)
 		oldK := mustKey(t)
-		ch := env.issue(t, fmt.Sprintf("dev-%d", iter), nil, 0)
+		ch := env.issue(t, fmt.Sprintf("dev-%d", iter), "tenant-a", nil, 0)
 		dev := mustRegister(t, env, ch, fmt.Sprintf("dev-%d", iter), nil, oldK)
 		newK := mustKey(t)
 		rot := beginRotation(t, env, dev, oldK, newK)
@@ -647,7 +647,7 @@ func TestRotation_ConfirmCancelTimeoutRace_OneTerminalState(t *testing.T) {
 func TestRotation_BeginGuards(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 
@@ -689,7 +689,7 @@ func TestRotation_BeginGuards(t *testing.T) {
 func TestAuthenticate_Failures(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	k := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, k)
 
 	if err := env.svc.Authenticate(AuthRequest{DeviceID: "ghost", KeyVersion: 1, Message: []byte("m"),
@@ -709,7 +709,7 @@ func TestAuthenticate_Failures(t *testing.T) {
 func TestDisable_AtomicallyTerminatesDeviceAndRotations(t *testing.T) {
 	env := newTestEnv(t, time.Minute, 10*time.Minute)
 	oldK := mustKey(t)
-	ch := env.issue(t, "dev-1", nil, 0)
+	ch := env.issue(t, "dev-1", "tenant-a", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, oldK)
 	newK := mustKey(t)
 	rot := beginRotation(t, env, dev, oldK, newK)
@@ -771,7 +771,7 @@ func TestFileStore_Roundtrip(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	oldK := mustKey(t)
-	ch, err := svc.IssueChallenge("dev-1", []byte("attr"), 0)
+	ch, err := svc.IssueChallenge("dev-1", "tenant-a", []byte("attr"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,6 +847,7 @@ func TestHTTPHandler_EndToEnd(t *testing.T) {
 	// 签发挑战。
 	issueBody := map[string]string{
 		"external_id": "dev-http-1",
+		"tenant_id":   "tenant-a",
 		"attributes":  EncodeBase64([]byte("attr")),
 	}
 	var ch Challenge

@@ -24,11 +24,14 @@ type Config struct {
 	ChallengeTTL time.Duration
 	// RotationWindow 密钥轮换的确认窗口；<=0 时使用默认值。
 	RotationWindow time.Duration
+	// TransferTTL 转移接收凭据的默认有效期；<=0 时使用默认值。
+	TransferTTL time.Duration
 }
 
 // Service 是设备注册与密钥生命周期管理服务。
 // 所有状态变更都在同一把互斥锁内完成并整体落盘：
-// 挑战一次性消费、轮换单一终态、禁用级联终止都由这把锁与快照原子写保证。
+// 挑战一次性消费、轮换单一终态、禁用级联终止、转移的接受/取消/过期单一终态
+// 都由这把锁与快照原子写保证。
 type Service struct {
 	mu    sync.Mutex
 	store *Store
@@ -37,6 +40,7 @@ type Service struct {
 
 	challengeTTL   time.Duration
 	rotationWindow time.Duration
+	transferTTL    time.Duration
 }
 
 // New 加载持久化状态并返回服务实例。
@@ -61,12 +65,17 @@ func New(cfg Config) (*Service, error) {
 	if window <= 0 {
 		window = DefaultRotationWindow
 	}
+	transferTTL := cfg.TransferTTL
+	if transferTTL <= 0 {
+		transferTTL = DefaultTransferTTL
+	}
 	return &Service{
 		store:          store,
 		snap:           snap,
 		clock:          clock,
 		challengeTTL:   ttl,
 		rotationWindow: window,
+		transferTTL:    transferTTL,
 	}, nil
 }
 
@@ -76,11 +85,15 @@ func (s *Service) saveLocked() error {
 }
 
 // IssueChallenge 由管理员调用，签发一次性注册挑战。
-// externalID 与 attributes 绑定预期设备：注册时必须原样带回。
+// externalID 与 attributes 绑定预期设备：注册时必须原样带回；
+// tenantID 绑定设备注册后的初始归属租户。
 // ttl <=0 时使用配置的默认有效期。返回值中的明文 Secret 仅此一次出现。
-func (s *Service) IssueChallenge(externalID string, attributes []byte, ttl time.Duration) (*Challenge, error) {
+func (s *Service) IssueChallenge(externalID, tenantID string, attributes []byte, ttl time.Duration) (*Challenge, error) {
 	if externalID == "" {
 		return nil, newError(ErrCodeInvalidArgument, "external id is required")
+	}
+	if tenantID == "" {
+		return nil, newError(ErrCodeInvalidArgument, "tenant id is required")
 	}
 	if ttl <= 0 {
 		ttl = s.challengeTTL
@@ -95,6 +108,7 @@ func (s *Service) IssueChallenge(externalID string, attributes []byte, ttl time.
 		SecretDigest: digestSecret(salt, secret),
 		ExternalID:   externalID,
 		Attributes:   append([]byte(nil), attributes...),
+		TenantID:     tenantID,
 		ExpiresAt:    now.Add(ttl),
 		CreatedAt:    now,
 	}
@@ -181,6 +195,8 @@ func (s *Service) Register(req RegisterRequest) (*DeviceView, error) {
 		ExternalID:        req.ExternalID,
 		Attributes:        append([]byte(nil), req.Attributes...),
 		ContentHash:       contentHash(req.Attributes, req.PublicKey),
+		TenantID:          ch.TenantID,
+		Version:           1,
 		Status:            DeviceStatusActive,
 		CurrentKeyVersion: 1,
 		NextKeyVersion:    1,
@@ -200,6 +216,14 @@ func (s *Service) Register(req RegisterRequest) (*DeviceView, error) {
 	ch.ConsumedByDevice = device.ID
 	s.snap.Devices[device.ID] = device
 	s.snap.ByExternal[device.ExternalID] = device.ID
+	// 归属链第一站：注册即初始归属，密钥版本从 0 到 1。
+	s.snap.Ownership[device.ID] = []*OwnershipEvent{{
+		Seq:         1,
+		TenantID:    ch.TenantID,
+		FromVersion: 0,
+		ToVersion:   1,
+		At:          now,
+	}}
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -252,6 +276,8 @@ func (s *Service) BeginRotation(deviceID string, newPublicKey, initiatorSignatur
 			return nil, newError(ErrCodeRotationInProgress, "device %q has an open rotation %q", deviceID, rid)
 		}
 	}
+	// 注意：活动转移不阻止发起轮换。轮换一旦在接受前完成会使设备版本前进，
+	// 转移接受随即以 device_version_mismatch 失败；接受时仍 pending 的轮换则被原子中止。
 
 	current := device.Keys[device.CurrentKeyVersion]
 	if !verifyMessage(current.PublicKey, RotationBeginMessage(deviceID, newPublicKey), initiatorSignature) {
@@ -353,6 +379,9 @@ func (s *Service) ConfirmRotation(rotationID string, confirmations ...KeyConfirm
 		newKey := device.Keys[rotation.NewVersion]
 		newKey.State = KeyStateActive
 		device.CurrentKeyVersion = rotation.NewVersion
+		// 当前密钥版本改变，设备版本同步递增；
+		// 已发起但未接受的转移冻结的是旧版本，届时会以版本不匹配被拒绝。
+		device.Version++
 		rotation.Status = RotationConfirmed
 		rotation.CompletedAt = &now
 		delete(s.snap.OpenRotation, device.ID)
@@ -509,6 +538,8 @@ func (s *Service) DisableDevice(deviceID string) (*DeviceView, error) {
 		}
 		delete(s.snap.OpenRotation, deviceID)
 	}
+	// 活动转移随禁用以同一快照变更中止；目标租户的迟到接受只会得到 transfer_closed。
+	s.abortTransferLocked(deviceID, now)
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}

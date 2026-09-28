@@ -105,6 +105,28 @@ func signAttestation(priv ed25519.PrivateKey, challengeID, externalID string, at
 	return ed25519.Sign(priv, attestationMessage(challengeID, externalID, attributes, pub))
 }
 
+// transferAttestationMessage 是接受转移时新私钥需要签名的规范报文。
+func transferAttestationMessage(transferID, deviceID, sourceTenantID, targetTenantID string, newPublicKey []byte) []byte {
+	return joinFields(
+		[]byte("TRANSFER_ACCEPT"),
+		[]byte(transferID),
+		[]byte(deviceID),
+		[]byte(sourceTenantID),
+		[]byte(targetTenantID),
+		newPublicKey,
+	)
+}
+
+// verifyTransferAttestation 用新公钥校验接受转移的证明签名。
+// 证明内容绑定转移单、设备、两端租户与新公钥本身，防止凭据被拿去为别的设备/租户/公钥完成接收。
+func verifyTransferAttestation(transferID, deviceID, sourceTenantID, targetTenantID string, newPublicKey, signature []byte) bool {
+	if len(newPublicKey) != ed25519.PublicKeySize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(newPublicKey),
+		transferAttestationMessage(transferID, deviceID, sourceTenantID, targetTenantID, newPublicKey), signature)
+}
+
 // signMessage 用设备私钥对业务报文（认证请求/轮换确认）签名。
 func signMessage(priv ed25519.PrivateKey, message []byte) []byte {
 	return ed25519.Sign(priv, message)
@@ -134,5 +156,19 @@ func contentHash(attributes, publicKey []byte) string {
 	h.Write(attributes)
 	h.Write([]byte{0})
 	h.Write(publicKey)
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+}
+
+// credentialMatches 以恒定时间比较一次性接收凭据与其加盐摘要。
+func credentialMatches(record *TransferRecord, credential string) bool {
+	return subtle.ConstantTimeCompare(record.CredentialDigest, digestSecret(record.CredentialSalt, credential)) == 1
+}
+
+// transferContentHash 对发起内容（设备 + 目标租户）取摘要，用于转移号幂等冲突判定。
+func transferContentHash(deviceID, targetTenantID string) string {
+	h := sha256.New()
+	h.Write([]byte(deviceID))
+	h.Write([]byte{0})
+	h.Write([]byte(targetTenantID))
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }

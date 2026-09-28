@@ -13,6 +13,7 @@ import (
 //	POST   /admin/challenges                 管理员签发挑战
 //	POST   /devices/register                 设备注册（幂等）
 //	GET    /devices/{id}                     查询设备
+//	GET    /devices/{id}/ownership           查询归属链与转移决定
 //	POST   /devices/{id}/rotations           发起密钥轮换
 //	POST   /devices/{id}/disable             管理员禁用设备
 //	POST   /devices/{id}/authenticate        认证校验
@@ -20,6 +21,11 @@ import (
 //	POST   /rotations/{id}/confirm           提交旧/新钥确认
 //	POST   /rotations/{id}/cancel            取消轮换
 //	POST   /admin/rotations/sweep            结算超时轮换
+//	POST   /devices/{id}/transfers           源租户发起设备转移
+//	POST   /transfers/{id}/accept            目标租户接受转移
+//	POST   /transfers/{id}/cancel            源租户取消转移
+//	GET    /transfers/{id}                   查询转移单
+//	POST   /admin/transfers/sweep            结算过期转移
 type Handler struct {
 	service *Service
 	mux     *http.ServeMux
@@ -39,18 +45,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /admin/challenges", h.issueChallenge)
 	h.mux.HandleFunc("POST /admin/rotations/sweep", h.sweepRotations)
+	h.mux.HandleFunc("POST /admin/transfers/sweep", h.sweepTransfers)
 	h.mux.HandleFunc("POST /devices/register", h.register)
 	h.mux.HandleFunc("GET /devices/{id}", h.getDevice)
+	h.mux.HandleFunc("GET /devices/{id}/ownership", h.getOwnership)
 	h.mux.HandleFunc("POST /devices/{id}/rotations", h.beginRotation)
 	h.mux.HandleFunc("POST /devices/{id}/disable", h.disableDevice)
 	h.mux.HandleFunc("POST /devices/{id}/authenticate", h.authenticate)
+	h.mux.HandleFunc("POST /devices/{id}/transfers", h.beginTransfer)
 	h.mux.HandleFunc("GET /rotations/{id}", h.getRotation)
 	h.mux.HandleFunc("POST /rotations/{id}/confirm", h.confirmRotation)
 	h.mux.HandleFunc("POST /rotations/{id}/cancel", h.cancelRotation)
+	h.mux.HandleFunc("GET /transfers/{id}", h.getTransfer)
+	h.mux.HandleFunc("POST /transfers/{id}/accept", h.acceptTransfer)
+	h.mux.HandleFunc("POST /transfers/{id}/cancel", h.cancelTransfer)
 }
 
 type issueChallengeRequest struct {
 	ExternalID string `json:"external_id"`
+	TenantID   string `json:"tenant_id"`
 	Attributes string `json:"attributes"`
 	// TTL 为 Go duration 字符串（如 "5m"）；空串使用服务默认值。
 	TTL string `json:"ttl"`
@@ -74,7 +87,7 @@ func (h *Handler) issueChallenge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ch, err := h.service.IssueChallenge(req.ExternalID, attrs, ttl)
+	ch, err := h.service.IssueChallenge(req.ExternalID, req.TenantID, attrs, ttl)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -133,6 +146,127 @@ func (h *Handler) getDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func (h *Handler) getOwnership(w http.ResponseWriter, r *http.Request) {
+	view, err := h.service.GetOwnershipChain(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+type beginTransferHTTPRequest struct {
+	SourceTenantID string `json:"source_tenant_id"`
+	TargetTenantID string `json:"target_tenant_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	TTL            string `json:"ttl"`
+}
+
+func (h *Handler) beginTransfer(w http.ResponseWriter, r *http.Request) {
+	var in beginTransferHTTPRequest
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	var ttl time.Duration
+	var err error
+	if in.TTL != "" {
+		ttl, err = time.ParseDuration(in.TTL)
+		if err != nil {
+			writeError(w, newError(ErrCodeInvalidArgument, "invalid ttl: %v", err))
+			return
+		}
+	}
+	tr, err := h.service.BeginTransfer(BeginTransferRequest{
+		DeviceID:       r.PathValue("id"),
+		SourceTenantID: in.SourceTenantID,
+		TargetTenantID: in.TargetTenantID,
+		IdempotencyKey: in.IdempotencyKey,
+		TTL:            ttl,
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, tr)
+}
+
+type acceptTransferHTTPRequest struct {
+	Credential     string `json:"credential"`
+	TargetTenantID string `json:"target_tenant_id"`
+	NewPublicKey   string `json:"new_public_key"`
+	Attestation    string `json:"attestation"`
+}
+
+func (h *Handler) acceptTransfer(w http.ResponseWriter, r *http.Request) {
+	var in acceptTransferHTTPRequest
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	newPub, err := decodeBase64(in.NewPublicKey)
+	if err != nil {
+		writeError(w, newError(ErrCodeInvalidArgument, "new_public_key must be base64: %v", err))
+		return
+	}
+	att, err := decodeBase64(in.Attestation)
+	if err != nil {
+		writeError(w, newError(ErrCodeInvalidArgument, "attestation must be base64: %v", err))
+		return
+	}
+	view, err := h.service.AcceptTransfer(AcceptTransferRequest{
+		TransferID:     r.PathValue("id"),
+		Credential:     in.Credential,
+		TargetTenantID: in.TargetTenantID,
+		NewPublicKey:   newPub,
+		Attestation:    att,
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+type cancelTransferHTTPRequest struct {
+	SourceTenantID string `json:"source_tenant_id"`
+	Signature      string `json:"signature"`
+}
+
+func (h *Handler) cancelTransfer(w http.ResponseWriter, r *http.Request) {
+	var in cancelTransferHTTPRequest
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	sig, err := decodeBase64(in.Signature)
+	if err != nil {
+		writeError(w, newError(ErrCodeInvalidArgument, "signature must be base64: %v", err))
+		return
+	}
+	view, err := h.service.CancelTransfer(r.PathValue("id"), in.SourceTenantID, sig)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (h *Handler) getTransfer(w http.ResponseWriter, r *http.Request) {
+	view, err := h.service.GetTransfer(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (h *Handler) sweepTransfers(w http.ResponseWriter, r *http.Request) {
+	n, err := h.service.SweepExpiredTransfers()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"expired": n})
 }
 
 type beginRotationHTTPRequest struct {
@@ -311,18 +445,20 @@ func httpStatusForError(err error) int {
 	switch ErrorCodeOf(err) {
 	case ErrCodeInvalidArgument:
 		return http.StatusBadRequest
-	case ErrCodeChallengeNotFound, ErrCodeDeviceNotFound, ErrCodeRotationNotFound, ErrCodeKeyVersionNotFound:
+	case ErrCodeChallengeNotFound, ErrCodeDeviceNotFound, ErrCodeRotationNotFound,
+		ErrCodeKeyVersionNotFound, ErrCodeTransferNotFound:
 		return http.StatusNotFound
-	case ErrCodeChallengeSecretMismatch, ErrCodeAttestationFailed, ErrCodeSignatureInvalid:
+	case ErrCodeChallengeSecretMismatch, ErrCodeAttestationFailed, ErrCodeSignatureInvalid,
+		ErrCodeTransferCredentialMismatch:
 		return http.StatusUnauthorized
-	case ErrCodeDeviceDisabled:
+	case ErrCodeDeviceDisabled, ErrCodeTenantMismatch:
 		return http.StatusForbidden
-	case ErrCodeChallengeExpired:
+	case ErrCodeChallengeExpired, ErrCodeTransferExpired:
 		return http.StatusGone
 	case "":
 		return http.StatusInternalServerError
 	default:
-		// consumed / 属性不匹配 / 幂等冲突 / 版本失效 / 轮换竞态等统一为 409。
+		// consumed / 属性不匹配 / 幂等冲突 / 版本失效 / 轮换或转移竞态等统一为 409。
 		return http.StatusConflict
 	}
 }
