@@ -12,6 +12,8 @@ import (
 const (
 	DefaultChallengeTTL   = 15 * time.Minute
 	DefaultRotationWindow = 10 * time.Minute
+	// DefaultTransferTTL 是跨租户转移一次性接收凭据的默认有效期。
+	DefaultTransferTTL = 15 * time.Minute
 )
 
 // Config 构造服务所需的配置。
@@ -24,6 +26,8 @@ type Config struct {
 	ChallengeTTL time.Duration
 	// RotationWindow 密钥轮换的确认窗口；<=0 时使用默认值。
 	RotationWindow time.Duration
+	// TransferTTL 跨租户转移接收凭据的默认有效期；<=0 时使用默认值。
+	TransferTTL time.Duration
 }
 
 // Service 是设备注册与密钥生命周期管理服务。
@@ -37,6 +41,7 @@ type Service struct {
 
 	challengeTTL   time.Duration
 	rotationWindow time.Duration
+	transferTTL    time.Duration
 }
 
 // New 加载持久化状态并返回服务实例。
@@ -61,12 +66,17 @@ func New(cfg Config) (*Service, error) {
 	if window <= 0 {
 		window = DefaultRotationWindow
 	}
+	ttlTransfer := cfg.TransferTTL
+	if ttlTransfer <= 0 {
+		ttlTransfer = DefaultTransferTTL
+	}
 	return &Service{
 		store:          store,
 		snap:           snap,
 		clock:          clock,
 		challengeTTL:   ttl,
 		rotationWindow: window,
+		transferTTL:    ttlTransfer,
 	}, nil
 }
 
@@ -75,10 +85,13 @@ func (s *Service) saveLocked() error {
 	return s.store.Save(s.snap)
 }
 
-// IssueChallenge 由管理员调用，签发一次性注册挑战。
+// IssueChallenge 由管理员调用，为指定租户签发一次性注册挑战。
 // externalID 与 attributes 绑定预期设备：注册时必须原样带回。
 // ttl <=0 时使用配置的默认有效期。返回值中的明文 Secret 仅此一次出现。
-func (s *Service) IssueChallenge(externalID string, attributes []byte, ttl time.Duration) (*Challenge, error) {
+func (s *Service) IssueChallenge(tenantID, externalID string, attributes []byte, ttl time.Duration) (*Challenge, error) {
+	if tenantID == "" {
+		return nil, newError(ErrCodeInvalidArgument, "tenant id is required")
+	}
 	if externalID == "" {
 		return nil, newError(ErrCodeInvalidArgument, "external id is required")
 	}
@@ -93,6 +106,7 @@ func (s *Service) IssueChallenge(externalID string, attributes []byte, ttl time.
 		ID:           randomID(),
 		Salt:         salt,
 		SecretDigest: digestSecret(salt, secret),
+		TenantID:     tenantID,
 		ExternalID:   externalID,
 		Attributes:   append([]byte(nil), attributes...),
 		ExpiresAt:    now.Add(ttl),
@@ -181,6 +195,7 @@ func (s *Service) Register(req RegisterRequest) (*DeviceView, error) {
 		ExternalID:        req.ExternalID,
 		Attributes:        append([]byte(nil), req.Attributes...),
 		ContentHash:       contentHash(req.Attributes, req.PublicKey),
+		TenantID:          ch.TenantID,
 		Status:            DeviceStatusActive,
 		CurrentKeyVersion: 1,
 		NextKeyVersion:    1,
@@ -192,6 +207,12 @@ func (s *Service) Register(req RegisterRequest) (*DeviceView, error) {
 				CreatedAt: now,
 			},
 		},
+		// 归属链首环：注册租户，密钥版本 1。
+		Ownership: []OwnershipLink{{
+			TenantID:   ch.TenantID,
+			KeyVersion: 1,
+			StartedAt:  now,
+		}},
 		CreatedAt: now,
 	}
 
@@ -250,6 +271,14 @@ func (s *Service) BeginRotation(deviceID string, newPublicKey, initiatorSignatur
 		s.sweepRotationLocked(s.snap.Rotations[rid], now)
 		if _, stillOpen := s.snap.OpenRotation[deviceID]; stillOpen {
 			return nil, newError(ErrCodeRotationInProgress, "device %q has an open rotation %q", deviceID, rid)
+		}
+	}
+	// 设备已有活动转移时不得发起轮换：转移已冻结当前密钥版本，直到接收/取消/过期。
+	if tid, ok := s.snap.OpenTransfer[deviceID]; ok {
+		s.sweepTransferLocked(s.snap.Transfers[tid], now)
+		if _, stillOpen := s.snap.OpenTransfer[deviceID]; stillOpen {
+			return nil, newError(ErrCodeTransferInProgress,
+				"device %q has an active transfer %q; rotation is forbidden until it closes", deviceID, tid)
 		}
 	}
 
@@ -442,18 +471,22 @@ func (s *Service) sweepRotationLocked(r *RotationRecord, now time.Time) bool {
 
 // AuthRequest 是一次设备认证请求。KeyVersion 绑定设备当前有效的密钥版本。
 type AuthRequest struct {
-	DeviceID   string
+	DeviceID string
+	// TenantID 是发起认证的租户，必须与设备当前归属一致。
+	// 设备转移后源租户不再匹配，其全部认证资格立即失效。
+	TenantID   string
 	KeyVersion int
 	Message    []byte
 	Signature  []byte
 }
 
 // Authenticate 校验认证请求。
-// 使用已失效的旧密钥版本（例如轮换完成后迟到的请求）会得到 ErrCodeKeyVersionInvalid，
-// 旧状态绝不可能借迟到请求覆盖新状态。
+// 使用已失效的旧密钥版本（例如轮换完成或设备转移后迟到的请求）会得到
+// ErrCodeKeyVersionInvalid；设备已转移到新租户后，源租户的迟到认证得到
+// ErrCodeTransferTenantMismatch，旧状态绝不可能借迟到请求覆盖新状态。
 func (s *Service) Authenticate(req AuthRequest) error {
-	if req.DeviceID == "" || req.KeyVersion <= 0 {
-		return newError(ErrCodeInvalidArgument, "device id and positive key version are required")
+	if req.DeviceID == "" || req.TenantID == "" || req.KeyVersion <= 0 {
+		return newError(ErrCodeInvalidArgument, "device id, tenant id and positive key version are required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -464,6 +497,10 @@ func (s *Service) Authenticate(req AuthRequest) error {
 	}
 	if device.Status != DeviceStatusActive {
 		return newError(ErrCodeDeviceDisabled, "device %q is disabled", req.DeviceID)
+	}
+	if device.TenantID != req.TenantID {
+		return newError(ErrCodeTransferTenantMismatch,
+			"device %q is no longer owned by tenant %q", req.DeviceID, req.TenantID)
 	}
 	key, ok := device.Keys[req.KeyVersion]
 	if !ok {
@@ -509,6 +546,8 @@ func (s *Service) DisableDevice(deviceID string) (*DeviceView, error) {
 		}
 		delete(s.snap.OpenRotation, deviceID)
 	}
+	// 活动转移一并原子中止：禁用的设备不能再被接收。
+	s.abortTransferForDeviceLocked(deviceID, now)
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}

@@ -22,6 +22,7 @@ func main() {
 	statePath := flag.String("state", "data/state.json", "JSON 快照持久化路径（留空为纯内存）")
 	challengeTTL := flag.Duration("challenge-ttl", 15*time.Minute, "注册挑战默认有效期")
 	rotationWindow := flag.Duration("rotation-window", 10*time.Minute, "密钥轮换确认窗口")
+	transferTTL := flag.Duration("transfer-ttl", 15*time.Minute, "跨租户转移接收凭据默认有效期")
 	flag.Parse()
 
 	svc, err := deviceenrollment.New(deviceenrollment.Config{
@@ -29,13 +30,14 @@ func main() {
 		Clock:          deviceenrollment.SystemClock(),
 		ChallengeTTL:   *challengeTTL,
 		RotationWindow: *rotationWindow,
+		TransferTTL:    *transferTTL,
 	})
 	if err != nil {
 		log.Fatalf("init service: %v", err)
 	}
 
-	log.Printf("device enrollment server listening on %s (state=%q, challenge-ttl=%s, rotation-window=%s)",
-		*addr, *statePath, *challengeTTL, *rotationWindow)
+	log.Printf("device enrollment server listening on %s (state=%q, challenge-ttl=%s, rotation-window=%s, transfer-ttl=%s)",
+		*addr, *statePath, *challengeTTL, *rotationWindow, *transferTTL)
 	if err := http.ListenAndServe(*addr, deviceenrollment.NewHandler(svc)); err != nil {
 		log.Fatal(err)
 	}

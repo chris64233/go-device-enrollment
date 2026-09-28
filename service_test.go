@@ -19,6 +19,9 @@ type testEnv struct {
 	clock *fixedClock
 }
 
+// testTenant 是现有测试中设备注册与认证使用的默认租户。
+const testTenant = "tenant-a"
+
 func newTestEnv(t *testing.T, ttl, window time.Duration) *testEnv {
 	t.Helper()
 	clock := NewFixedClock(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
@@ -50,7 +53,7 @@ func mustKey(t *testing.T) deviceKey {
 
 func (e *testEnv) issue(t *testing.T, external string, attrs []byte, ttl time.Duration) *Challenge {
 	t.Helper()
-	ch, err := e.svc.IssueChallenge(external, attrs, ttl)
+	ch, err := e.svc.IssueChallenge(testTenant, external, attrs, ttl)
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -91,6 +94,7 @@ func mustAuth(t *testing.T, svc *Service, dev *DeviceView, k deviceKey, msg []by
 	t.Helper()
 	if err := svc.Authenticate(AuthRequest{
 		DeviceID:   dev.ID,
+		TenantID:   dev.TenantID,
 		KeyVersion: dev.CurrentKeyVersion,
 		Message:    msg,
 		Signature:  signMessage(k.priv, msg),
@@ -403,7 +407,7 @@ func TestRotation_HappyPath(t *testing.T) {
 
 	// 旧钥版本的迟到认证请求必须被拒绝，不能覆盖新状态。
 	err = env.svc.Authenticate(AuthRequest{
-		DeviceID: dev.ID, KeyVersion: 1,
+		DeviceID: dev.ID, TenantID: testTenant, KeyVersion: 1,
 		Message:   []byte("late"),
 		Signature: signMessage(oldK.priv, []byte("late")),
 	})
@@ -692,15 +696,15 @@ func TestAuthenticate_Failures(t *testing.T) {
 	ch := env.issue(t, "dev-1", nil, 0)
 	dev := mustRegister(t, env, ch, "dev-1", nil, k)
 
-	if err := env.svc.Authenticate(AuthRequest{DeviceID: "ghost", KeyVersion: 1, Message: []byte("m"),
+	if err := env.svc.Authenticate(AuthRequest{DeviceID: "ghost", TenantID: testTenant, KeyVersion: 1, Message: []byte("m"),
 		Signature: signMessage(k.priv, []byte("m"))}); ErrorCodeOf(err) != ErrCodeDeviceNotFound {
 		t.Fatalf("want device not found, got %v", err)
 	}
-	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, KeyVersion: 9, Message: []byte("m"),
+	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, TenantID: testTenant, KeyVersion: 9, Message: []byte("m"),
 		Signature: signMessage(k.priv, []byte("m"))}); ErrorCodeOf(err) != ErrCodeKeyVersionNotFound {
 		t.Fatalf("want key not found, got %v", err)
 	}
-	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, KeyVersion: 1, Message: []byte("m"),
+	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, TenantID: testTenant, KeyVersion: 1, Message: []byte("m"),
 		Signature: make([]byte, 64)}); ErrorCodeOf(err) != ErrCodeSignatureInvalid {
 		t.Fatalf("want signature invalid, got %v", err)
 	}
@@ -723,7 +727,7 @@ func TestDisable_AtomicallyTerminatesDeviceAndRotations(t *testing.T) {
 	}
 
 	// 注册有效性终止：认证一律拒绝。
-	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, KeyVersion: 1, Message: []byte("x"),
+	if err := env.svc.Authenticate(AuthRequest{DeviceID: dev.ID, TenantID: testTenant, KeyVersion: 1, Message: []byte("x"),
 		Signature: signMessage(oldK.priv, []byte("x"))}); ErrorCodeOf(err) != ErrCodeDeviceDisabled {
 		t.Fatalf("want disabled on auth, got %v", err)
 	}
@@ -771,7 +775,7 @@ func TestFileStore_Roundtrip(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	oldK := mustKey(t)
-	ch, err := svc.IssueChallenge("dev-1", []byte("attr"), 0)
+	ch, err := svc.IssueChallenge(testTenant, "dev-1", []byte("attr"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +831,7 @@ func TestFileStore_Roundtrip(t *testing.T) {
 	if got3.CurrentKeyVersion != 2 || got3.Status != DeviceStatusActive {
 		t.Fatalf("final state mismatch: %+v", got3)
 	}
-	if err := svc3.Authenticate(AuthRequest{DeviceID: dev.ID, KeyVersion: 2,
+	if err := svc3.Authenticate(AuthRequest{DeviceID: dev.ID, TenantID: testTenant, KeyVersion: 2,
 		Message:   []byte("after-restart"),
 		Signature: signMessage(newK.priv, []byte("after-restart"))}); err != nil {
 		t.Fatalf("auth with new key after restart: %v", err)
@@ -846,6 +850,7 @@ func TestHTTPHandler_EndToEnd(t *testing.T) {
 
 	// 签发挑战。
 	issueBody := map[string]string{
+		"tenant_id":   testTenant,
 		"external_id": "dev-http-1",
 		"attributes":  EncodeBase64([]byte("attr")),
 	}
@@ -873,6 +878,7 @@ func TestHTTPHandler_EndToEnd(t *testing.T) {
 
 	// 认证成功（204 无响应体）。
 	authBody := map[string]any{
+		"tenant_id":   testTenant,
 		"key_version": 1,
 		"message":     EncodeBase64([]byte("ping")),
 		"signature":   EncodeBase64(signMessage(oldK.priv, []byte("ping"))),
@@ -898,6 +904,7 @@ func TestHTTPHandler_EndToEnd(t *testing.T) {
 
 	// 旧钥认证 -> 409（key_version_invalid 映射冲突）。
 	oldAuth := map[string]any{
+		"tenant_id":   testTenant,
 		"key_version": 1,
 		"message":     EncodeBase64([]byte("late")),
 		"signature":   EncodeBase64(signMessage(oldK.priv, []byte("late"))),
@@ -907,6 +914,7 @@ func TestHTTPHandler_EndToEnd(t *testing.T) {
 	// 禁用 -> 后续认证 403。
 	doJSON(t, http.MethodPost, srv.URL+"/devices/"+dev.ID+"/disable", http.StatusOK, struct{}{}, nil)
 	authBody2 := map[string]any{
+		"tenant_id":   testTenant,
 		"key_version": 2,
 		"message":     EncodeBase64([]byte("x")),
 		"signature":   EncodeBase64(signMessage(newK.priv, []byte("x"))),

@@ -136,3 +136,14 @@ func contentHash(attributes, publicKey []byte) string {
 	h.Write(publicKey)
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
+
+// hashFields 对带前缀的若干字段做分隔摘要，用于转移幂等内容的一致性判定。
+func hashFields(prefix string, fields ...[]byte) string {
+	h := sha256.New()
+	h.Write([]byte(prefix))
+	for _, f := range fields {
+		h.Write([]byte{0})
+		h.Write(f)
+	}
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+}
