@@ -147,7 +147,8 @@ type TransferRecord struct {
 	AcceptedNewKeyVersion int `json:"accepted_new_key_version,omitempty"`
 }
 
-// Transfer 是发起转移时返回给源租户的明文视图。Credential 仅在本次响应（或幂等重放）中出现。
+// Transfer 是发起转移时返回给源租户的明文视图。
+// Credential 只在首次发起的响应中出现一次；幂等重放只返回转移单 ID，不再展示凭据。
 type Transfer struct {
 	ID         string `json:"id"`
 	Credential string `json:"credential"`
