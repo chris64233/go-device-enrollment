@@ -325,6 +325,53 @@ func TestTransfer_Accept_MismatchesChangeNothing(t *testing.T) {
 	})
 }
 
+// 失败的接受尝试是零副作用的：凭据仍然一次性、可在修正请求后继续使用；
+// 一旦接受成功，凭据立即作废，重复接收被终态拒绝。
+func TestTransfer_Accept_FailedAttemptThenSuccessConsumesCredentialOnce(t *testing.T) {
+	f := setupTransferableDevice(t, 0)
+	tr, rec := beginTransferFor(t, f, tenantB, 0)
+
+	// 第一次用错误凭据：整单失败、零副作用（已由 MismatchesChangeNothing 覆盖状态不变），
+	// 这里进一步验证凭据并未被“预消费”。
+	targetK := mustKey(t)
+	goodAtt := acceptSig(targetK.priv, rec, targetK.pub)
+	if _, err := f.env.svc.AcceptTransfer(AcceptTransferRequest{
+		TransferID: tr.ID, Credential: "not-the-credential", TargetTenantID: tenantB,
+		NewPublicKey: targetK.pub, Attestation: goodAtt,
+	}); ErrorCodeOf(err) != ErrCodeTransferCredentialMismatch {
+		t.Fatalf("want credential mismatch, got %v", err)
+	}
+
+	// 证明错误再来一次，凭据依旧可用。
+	if _, err := f.env.svc.AcceptTransfer(AcceptTransferRequest{
+		TransferID: tr.ID, Credential: tr.Credential, TargetTenantID: tenantB,
+		NewPublicKey: targetK.pub, Attestation: make([]byte, ed25519.SignatureSize),
+	}); ErrorCodeOf(err) != ErrCodeAttestationFailed {
+		t.Fatalf("want attestation failed, got %v", err)
+	}
+
+	// 修正请求后接受成功，凭据在成功的这一刻才被一次性消费。
+	view, err := f.env.svc.AcceptTransfer(AcceptTransferRequest{
+		TransferID: tr.ID, Credential: tr.Credential, TargetTenantID: tenantB,
+		NewPublicKey: targetK.pub, Attestation: goodAtt,
+	})
+	if err != nil {
+		t.Fatalf("accept after failed attempts: %v", err)
+	}
+	if view.Status != TransferAccepted {
+		t.Fatalf("status = %s", view.Status)
+	}
+
+	// 同一凭据不可再次接收同一设备（即使换一把新公钥与证明）。
+	otherK := mustKey(t)
+	if _, err := f.env.svc.AcceptTransfer(AcceptTransferRequest{
+		TransferID: tr.ID, Credential: tr.Credential, TargetTenantID: tenantB,
+		NewPublicKey: otherK.pub, Attestation: acceptSig(otherK.priv, rec, otherK.pub),
+	}); ErrorCodeOf(err) != ErrCodeTransferClosed {
+		t.Fatalf("want closed on credential reuse, got %v", err)
+	}
+}
+
 // 设备版本不匹配：发起后完成了轮换，接受必须失败且归属保持不变。
 func TestTransfer_Accept_DeviceVersionMismatch(t *testing.T) {
 	f := setupTransferableDevice(t, 0)
@@ -388,6 +435,122 @@ func TestTransfer_Accept_AbortsPendingRotationAndRejectsLateConfirm(t *testing.T
 	}
 	if f.env.svc.snap.Devices[f.dev.ID].Keys[2].State != KeyStateInvalidated {
 		t.Fatal("aborted rotation pending key must be invalidated")
+	}
+}
+
+// 转移成功后旧租户与新归属彻底脱钩：既不能再发起转移，也不能再发起轮换；
+// 新租户在同一设备上的生命周期正常运转。
+func TestTransfer_Accept_OldTenantFullyDetached(t *testing.T) {
+	f := setupTransferableDevice(t, 0)
+	tr, _ := beginTransferFor(t, f, tenantB, 0)
+	keyB := mustKey(t)
+	acceptOK(t, f, tr, tenantB, keyB)
+
+	// 旧租户再发起转移：非属主。
+	if _, err := f.env.svc.BeginTransfer(BeginTransferRequest{
+		DeviceID: f.dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantC,
+		IdempotencyKey: "stale-begin",
+	}); ErrorCodeOf(err) != ErrCodeTenantMismatch {
+		t.Fatalf("old tenant begin transfer: want tenant mismatch, got %v", err)
+	}
+
+	// 旧租户用旧钥发起轮换：签名能验证（旧钥仍在册），但旧钥已不是当前钥，
+	// 不能驱动新归属下的设备。
+	intruderPub := mustKey(t).pub
+	if _, err := f.env.svc.BeginRotation(f.dev.ID, intruderPub,
+		signMessage(f.oldK.priv, RotationBeginMessage(f.dev.ID, intruderPub)),
+	); ErrorCodeOf(err) != ErrCodeSignatureInvalid {
+		t.Fatalf("old key begin rotation: want signature invalid, got %v", err)
+	}
+	// 旧钥在新归属下也不能认证。
+	if err := f.env.svc.Authenticate(AuthRequest{
+		DeviceID: f.dev.ID, KeyVersion: 1, Message: []byte("x"),
+		Signature: signMessage(f.oldK.priv, []byte("x")),
+	}); ErrorCodeOf(err) != ErrCodeKeyVersionInvalid {
+		t.Fatalf("old key auth: want key version invalid, got %v", err)
+	}
+
+	// 新租户钥发起轮换并完成：设备版本继续前进，旧钥状态保持失效。
+	keyC := mustKey(t)
+	rot, err := f.env.svc.BeginRotation(f.dev.ID, keyC.pub,
+		signMessage(keyB.priv, RotationBeginMessage(f.dev.ID, keyC.pub)))
+	if err != nil {
+		t.Fatalf("new owner begin rotation: %v", err)
+	}
+	if _, err := f.env.svc.ConfirmRotation(rot.ID,
+		KeyConfirmation{2, signMessage(keyB.priv, confirmMsg(rot))},
+		KeyConfirmation{3, signMessage(keyC.priv, confirmMsg(rot))},
+	); err != nil {
+		t.Fatalf("new owner confirm rotation: %v", err)
+	}
+	got := f.env.svc.snap.Devices[f.dev.ID]
+	if got.TenantID != tenantB || got.Version != 3 || got.CurrentKeyVersion != 3 ||
+		got.Keys[1].State != KeyStateInvalidated || got.Keys[2].State != KeyStateInvalidated {
+		t.Fatalf("device after new-owner rotation wrong: %+v", got)
+	}
+	if err := f.env.svc.Authenticate(AuthRequest{
+		DeviceID: f.dev.ID, KeyVersion: 3, Message: []byte("c"),
+		Signature: signMessage(keyC.priv, []byte("c")),
+	}); err != nil {
+		t.Fatalf("new owner key v3 auth: %v", err)
+	}
+}
+
+// 转移窗口内源租户完成了轮换：接受会因设备版本前进被拒；
+// 源租户用发起时冻结的旧钥签名仍可取消这张已不可能被接受的转移单，
+// 取消不触碰新版本密钥，设备留在源租户并以新钥继续运转。
+func TestTransfer_RotationCompletedDuringWindow_CancelStillPossible(t *testing.T) {
+	f := setupTransferableDevice(t, 0)
+	tr, rec := beginTransferFor(t, f, tenantB, 0)
+
+	rotK := mustKey(t)
+	rot := beginRotation(t, f.env, f.dev, f.oldK, rotK)
+	if _, err := f.env.svc.ConfirmRotation(rot.ID,
+		KeyConfirmation{1, signMessage(f.oldK.priv, confirmMsg(rot))},
+		KeyConfirmation{2, signMessage(rotK.priv, confirmMsg(rot))},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// 接受：设备版本不匹配，零副作用。
+	targetK := mustKey(t)
+	if _, err := f.env.svc.AcceptTransfer(AcceptTransferRequest{
+		TransferID: tr.ID, Credential: tr.Credential, TargetTenantID: tenantB,
+		NewPublicKey: targetK.pub, Attestation: acceptSig(targetK.priv, rec, targetK.pub),
+	}); ErrorCodeOf(err) != ErrCodeDeviceVersionMismatch {
+		t.Fatalf("want device version mismatch, got %v", err)
+	}
+
+	// 用冻结的旧钥签名取消：成功；旧钥虽已失效，但签名密码学上仍可验证。
+	view, err := f.env.svc.CancelTransfer(tr.ID, tenantA,
+		signMessage(f.oldK.priv, TransferCancelMessage(f.dev.ID, tr.ID)))
+	if err != nil {
+		t.Fatalf("cancel with frozen key after rotation: %v", err)
+	}
+	if view.Status != TransferCancelled {
+		t.Fatalf("status = %s", view.Status)
+	}
+
+	// 设备留在源租户，轮换后的 v2 钥保持有效，旧 v1 钥保持失效。
+	dev := f.env.svc.snap.Devices[f.dev.ID]
+	if dev.TenantID != tenantA || dev.Version != 2 || dev.CurrentKeyVersion != 2 ||
+		dev.Keys[1].State != KeyStateInvalidated || dev.Keys[2].State != KeyStateActive {
+		t.Fatalf("device after cancel wrong: %+v", dev)
+	}
+	mustAuth(t, f.env.svc,
+		&DeviceView{ID: dev.ID, CurrentKeyVersion: 2}, rotK, []byte("still source"))
+
+	// 取消后可就当前状态重新发起一张转移（冻结点更新到 v2）。
+	tr2, err := f.env.svc.BeginTransfer(BeginTransferRequest{
+		DeviceID: dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantB, IdempotencyKey: "after-rot",
+	})
+	if err != nil {
+		t.Fatalf("re-begin after rotation+cancel: %v", err)
+	}
+	rec2 := f.env.svc.snap.Transfers[tr2.ID]
+	if rec2.FrozenKeyVersion != 2 || rec2.FrozenDeviceVersion != 2 {
+		t.Fatalf("re-begin frozen snapshot = key %d dev %d, want 2/2",
+			rec2.FrozenKeyVersion, rec2.FrozenDeviceVersion)
 	}
 }
 
@@ -662,7 +825,144 @@ func TestTransfer_Idempotency_SameKeySameContentReturnsFirst(t *testing.T) {
 	}
 }
 
+// 转移号的幂等语义在终态之后仍然成立：同号同内容始终返回首次转移单；
+// 同号异内容（哪怕首次单早已取消或过期）一律冲突。
+func TestTransfer_Idempotency_HoldsAcrossTerminalStates(t *testing.T) {
+	// 取消后：重放返回首单，换内容冲突；需要新转移必须换新转移号。
+	f := setupTransferableDevice(t, 0)
+	req := BeginTransferRequest{
+		DeviceID: f.dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantB, IdempotencyKey: "idem-cancel",
+	}
+	first, err := f.env.svc.BeginTransfer(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.env.svc.CancelTransfer(first.ID, tenantA,
+		signMessage(f.oldK.priv, TransferCancelMessage(f.dev.ID, first.ID))); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := f.env.svc.BeginTransfer(req)
+	if err != nil {
+		t.Fatalf("replay after cancel: %v", err)
+	}
+	if replay.ID != first.ID || replay.Credential != "" {
+		t.Fatalf("replay = %+v, want first id without credential", replay)
+	}
+	diff := req
+	diff.TargetTenantID = tenantC
+	if _, err := f.env.svc.BeginTransfer(diff); ErrorCodeOf(err) != ErrCodeConflict {
+		t.Fatalf("different content with same key after cancel: want conflict, got %v", err)
+	}
+	next := req
+	next.IdempotencyKey = "idem-cancel-2"
+	next2, err := f.env.svc.BeginTransfer(next)
+	if err != nil {
+		t.Fatalf("fresh key after cancel should open a new transfer: %v", err)
+	}
+	if next2.ID == first.ID {
+		t.Fatal("new transfer reused cancelled id")
+	}
+
+	// 过期后：同样的幂等语义。
+	f2 := setupTransferableDevice(t, time.Minute)
+	req2 := BeginTransferRequest{
+		DeviceID: f2.dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantB, IdempotencyKey: "idem-expire",
+	}
+	exp, err := f2.env.svc.BeginTransfer(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2.env.clock.Advance(time.Minute + time.Nanosecond)
+	if n, _ := f2.env.svc.SweepExpiredTransfers(); n != 1 {
+		t.Fatalf("sweep = %d, want 1", n)
+	}
+	replay2, err := f2.env.svc.BeginTransfer(req2)
+	if err != nil {
+		t.Fatalf("replay after expiry: %v", err)
+	}
+	if replay2.ID != exp.ID {
+		t.Fatalf("replay id = %s, want %s", replay2.ID, exp.ID)
+	}
+
+	// 接受后：原属主不再拥有设备，同号同内容重放仍先命中幂等记录返回首单，
+	// 不会再产生第二张单；同号异内容同样冲突。
+	f3 := setupTransferableDevice(t, 0)
+	req3 := BeginTransferRequest{
+		DeviceID: f3.dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantB, IdempotencyKey: "idem-accept",
+	}
+	acc, err := f3.env.svc.BeginTransfer(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB := mustKey(t)
+	acceptOK(t, f3, acc, tenantB, keyB)
+	replay3, err := f3.env.svc.BeginTransfer(req3)
+	if err != nil {
+		t.Fatalf("replay after accept: %v", err)
+	}
+	if replay3.ID != acc.ID || replay3.Credential != "" {
+		t.Fatalf("replay = %+v, want first id without credential", replay3)
+	}
+	if len(f3.env.svc.snap.Transfers) != 1 {
+		t.Fatal("replay after accept created another transfer")
+	}
+	diff3 := req3
+	diff3.TargetTenantID = tenantC
+	if _, err := f3.env.svc.BeginTransfer(diff3); ErrorCodeOf(err) != ErrCodeConflict {
+		t.Fatalf("different content with same key after accept: want conflict, got %v", err)
+	}
+}
+
 // ---- 归属链与多跳转移 ----
+
+// 并发使用同一 (源租户, 转移号) 发起：只能建立一张转移单，全部调用返回同一 ID。
+func TestTransfer_Idempotency_ConcurrentSameKey(t *testing.T) {
+	f := setupTransferableDevice(t, 0)
+	req := BeginTransferRequest{
+		DeviceID: f.dev.ID, SourceTenantID: tenantA, TargetTenantID: tenantB, IdempotencyKey: "idem-race",
+	}
+
+	const n = 32
+	results := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			tr, err := f.env.svc.BeginTransfer(req)
+			if err == nil {
+				results[i] = tr.ID
+			}
+			errs[i] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var first string
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent begin %d: %v", i, errs[i])
+		}
+		if results[i] == "" {
+			t.Fatalf("concurrent begin %d returned empty id", i)
+		}
+		if first == "" {
+			first = results[i]
+		} else if results[i] != first {
+			t.Fatalf("concurrent begin %d id = %q, want %q", i, results[i], first)
+		}
+	}
+	if len(f.env.svc.snap.Transfers) != 1 {
+		t.Fatalf("transfers = %d, want exactly 1", len(f.env.svc.snap.Transfers))
+	}
+	if f.env.svc.snap.OpenTransfer[f.dev.ID] != first {
+		t.Fatal("open transfer index does not point to the unique record")
+	}
+}
 
 func TestTransfer_OwnershipChain_MultipleHops(t *testing.T) {
 	f := setupTransferableDevice(t, 0)
@@ -741,6 +1041,79 @@ func TestTransfer_OwnershipChain_MultipleHops(t *testing.T) {
 
 	if _, err := f.env.svc.GetOwnershipChain("ghost"); ErrorCodeOf(err) != ErrCodeDeviceNotFound {
 		t.Fatalf("want not found, got %v", err)
+	}
+}
+
+// 归属链除 accepted 多跳外，还应逐单展示取消/过期等非接受终态的两端决定与
+// 冻结/未变化的密钥版本；非接受转移不得产生新的归属站。
+func TestTransfer_OwnershipChain_RecordsCancelledAndExpiredDecisions(t *testing.T) {
+	f := setupTransferableDevice(t, 0)
+
+	// 第一张：取消。
+	cancelled, _ := beginTransferFor(t, f, tenantB, 0)
+	if _, err := f.env.svc.CancelTransfer(cancelled.ID, tenantA,
+		signMessage(f.oldK.priv, TransferCancelMessage(f.dev.ID, cancelled.ID))); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第二张：过期。
+	expired, _ := beginTransferFor(t, f, tenantB, time.Minute)
+	f.env.clock.Advance(time.Minute + time.Nanosecond)
+	if n, err := f.env.svc.SweepExpiredTransfers(); err != nil || n != 1 {
+		t.Fatalf("sweep = (%d, %v), want 1", n, err)
+	}
+
+	// 第三张：接受（v1 -> v2）。
+	accepted, _ := beginTransferFor(t, f, tenantB, 0)
+	keyB := mustKey(t)
+	acceptOK(t, f, accepted, tenantB, keyB)
+
+	chain, err := f.env.svc.GetOwnershipChain(f.dev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 取消与过期没有改变归属，归属站仍只有注册 + 接受两站。
+	if len(chain.History) != 2 {
+		t.Fatalf("history len = %d, want 2", len(chain.History))
+	}
+	if chain.Current.TenantID != tenantB || chain.Current.FromVersion != 1 || chain.Current.ToVersion != 2 {
+		t.Fatalf("current = %+v", chain.Current)
+	}
+	if len(chain.Transfers) != 3 {
+		t.Fatalf("transfers = %d, want 3", len(chain.Transfers))
+	}
+
+	byID := map[string]TransferView{}
+	for _, tv := range chain.Transfers {
+		byID[tv.ID] = tv
+	}
+	cv := byID[cancelled.ID]
+	if cv.Status != TransferCancelled || cv.SourceDecision != SourceDecisionCancelled ||
+		cv.TargetDecision != TargetDecisionNone || cv.NewKeyVersion != 0 ||
+		cv.FrozenKeyVersion != 1 || cv.FrozenDeviceVersion != 1 {
+		t.Fatalf("cancelled view wrong: %+v", cv)
+	}
+	ev := byID[expired.ID]
+	if ev.Status != TransferExpired || ev.SourceDecision != SourceDecisionRequested ||
+		ev.TargetDecision != TargetDecisionNone || ev.NewKeyVersion != 0 {
+		t.Fatalf("expired view wrong: %+v", ev)
+	}
+	av := byID[accepted.ID]
+	if av.Status != TransferAccepted || av.SourceDecision != SourceDecisionRequested ||
+		av.TargetDecision != TargetDecisionAccepted || av.NewKeyVersion != 2 {
+		t.Fatalf("accepted view wrong: %+v", av)
+	}
+
+	// 单查接口与链上视图一致，且同样不暴露敏感材料。
+	got, err := f.env.svc.GetTransfer(cancelled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(got)
+	for _, banned := range []string{"credential", "salt", "digest", "attestation", "public_key"} {
+		if bytes.Contains(bytes.ToLower(raw), []byte(banned)) {
+			t.Fatalf("GetTransfer leaked %q: %s", banned, raw)
+		}
 	}
 }
 
